@@ -307,13 +307,13 @@ static bool hookGetNameTag() {
         }
 
         void* orig = nullptr;
-        int ret = GlossHook((void*)addr, (void*)hook_getNameTag, &orig);
-        if (ret == 0) {
+        void* hookResult = GlossHook((void*)addr, (void*)hook_getNameTag, &orig);
+        if (hookResult) {
             g_orig_getNameTag = orig;
             LOGI("getNameTag sig[%d]: hooked OK @ 0x%lx", i, (unsigned long)addr);
             return true;
         }
-        LOGE("getNameTag sig[%d]: GlossHook ret=%d", i, ret);
+        LOGE("getNameTag sig[%d]: GlossHook failed", i);
     }
 
     LOGE("getNameTag: semua sig gagal");
