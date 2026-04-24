@@ -12,7 +12,6 @@ constexpr uint8_t THIRD_PERSON_NAMETAG_SIG[] = {
     0x0F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x49, 0x8B, 0x45, 0x00, 0x49, 0x8B, 0xCD, 0x48, 0x8B, 0x80,
     0x00, 0x00, 0x00, 0x00, 0xFF, 0x15, 0x00, 0x00, 0x00, 0x00, 0x84, 0xC0, 0x0F, 0x85
 };
-
 constexpr uint8_t THIRD_PERSON_NAMETAG_MASK[] = {
     0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
     0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF
@@ -24,10 +23,7 @@ static uintptr_t FindPattern(uintptr_t base, size_t size,
     for (size_t i = 0; i < size - patternLen; ++i) {
         bool found = true;
         for (size_t j = 0; j < patternLen; ++j) {
-            if (mask[j] == 0xFF && data[i + j] != pattern[j]) {
-                found = false;
-                break;
-            }
+            if (mask[j] == 0xFF && data[i + j] != pattern[j]) { found = false; break; }
         }
         if (found) return base + i;
     }
@@ -42,7 +38,6 @@ static void ApplyPatch() {
     VirtualProtect(g_instructionPointer, INSTRUCTION_SIZE, protect, &protect);
     g_patched = true;
 }
-
 static void RemovePatch() {
     if (!g_instructionPointer || !g_patched) return;
     DWORD protect;
@@ -51,29 +46,24 @@ static void RemovePatch() {
     VirtualProtect(g_instructionPointer, INSTRUCTION_SIZE, protect, &protect);
     g_patched = false;
 }
-
 static void Initialize() {
     HMODULE base = GetModuleHandleA(nullptr);
     if (!base) return;
-
     auto dosHeader = reinterpret_cast<PIMAGE_DOS_HEADER>(base);
     auto ntHeaders = reinterpret_cast<PIMAGE_NT_HEADERS>(
         reinterpret_cast<uintptr_t>(base) + dosHeader->e_lfanew);
     size_t sizeOfImage = ntHeaders->OptionalHeader.SizeOfImage;
-
     uintptr_t targetAddr = FindPattern(
         reinterpret_cast<uintptr_t>(base), sizeOfImage,
         THIRD_PERSON_NAMETAG_SIG, THIRD_PERSON_NAMETAG_MASK,
         sizeof(THIRD_PERSON_NAMETAG_SIG));
-
     if (targetAddr) {
         g_instructionPointer = reinterpret_cast<void*>(targetAddr);
         memcpy(g_originalBytes, g_instructionPointer, INSTRUCTION_SIZE);
         ApplyPatch();
     }
 }
-
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID /*reserved*/) {
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(hModule);
         std::thread(Initialize).detach();
@@ -85,11 +75,14 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID /*reserved*/) {
 
 #else
 // ═══════════════════════════════════════════════════════════
-//  ANDROID - ThirdPersonNametag + FPS/Ping display v3
+//  ANDROID - ThirdPersonNametag + FPS display v4
 //
-//  FPS hook pakai 2 strategi fallback:
-//  1. Vtable hook Actor slot getNameTag (tidak tergantung signature)
-//  2. Signature scan multi-kandidat (toleran beda versi)
+//  v4 perubahan:
+//  - HAPUS vtable hook getNameTag (penyebab crash)
+//  - Sig scan saja, tapi lebih defensive:
+//    * Verifikasi alamat hasil scan masuk range .text
+//    * Hanya hook jika GlossHook sukses
+//    * Kalau gagal = nametag normal, tidak crash
 // ═══════════════════════════════════════════════════════════
 #include <cstdint>
 #include <cstring>
@@ -132,14 +125,37 @@ static constexpr size_t PATCH_OFFSET = 8;
 static const uint8_t PATCH_BYTES[4] = { 0x1F, 0x20, 0x03, 0xD5 };
 static const size_t  PATCH_SIZE     = sizeof(PATCH_BYTES);
 
-static uint8_t g_originalBytes[PATCH_SIZE] = {};
+static uint8_t g_origBytes[PATCH_SIZE] = {};
 static void*   g_patchTarget = nullptr;
 static bool    g_isPatched   = false;
 
-// Helper: scan memory untuk string/pattern
+static bool PatchMemory(void* addr, const void* data, size_t size) {
+    uintptr_t page_start = (uintptr_t)addr & ~(4095UL);
+    size_t    page_size  = ((uintptr_t)addr + size - page_start + 4095) & ~(4095UL);
+    if (mprotect((void*)page_start, page_size, PROT_READ|PROT_WRITE|PROT_EXEC) != 0) return false;
+    memcpy(addr, data, size);
+    __builtin___clear_cache((char*)addr, (char*)addr + size);
+    mprotect((void*)page_start, page_size, PROT_READ|PROT_EXEC);
+    return true;
+}
+
+static bool PatchNametag() {
+    uintptr_t addr = pl::signature::pl_resolve_signature(NAMETAG_SIGNATURE, MCPE_LIB);
+    if (!addr) return false;
+    g_patchTarget = reinterpret_cast<void*>(addr + PATCH_OFFSET);
+    memcpy(g_origBytes, g_patchTarget, PATCH_SIZE);
+    if (PatchMemory(g_patchTarget, PATCH_BYTES, PATCH_SIZE)) { g_isPatched = true; return true; }
+    return false;
+}
+
+static bool UnpatchNametag() {
+    if (!g_patchTarget || !g_isPatched) return false;
+    if (PatchMemory(g_patchTarget, g_origBytes, PATCH_SIZE)) { g_isPatched = false; return true; }
+    return false;
+}
+
 static uintptr_t scanMem(uintptr_t base, size_t sz, const void* pat, size_t plen) {
-    auto* m = (const uint8_t*)base;
-    auto* p = (const uint8_t*)pat;
+    auto* m = (const uint8_t*)base; auto* p = (const uint8_t*)pat;
     for (size_t i = 0; i+plen <= sz; ++i)
         if (memcmp(m+i, p, plen) == 0) return base+i;
     return 0;
@@ -148,25 +164,20 @@ static uintptr_t scanMem(uintptr_t base, size_t sz, const void* pat, size_t plen
 static bool hookVtable(const char* cls, int slot, void** outOrig, void* hookFn) {
     size_t rodataSize = 0;
     uintptr_t rodata = GlossGetLibSection(MCPE_LIB, ".rodata", &rodataSize);
-    if (!rodata || !rodataSize) { LOGE("hookVtable: no .rodata for %s", cls); return false; }
-
+    if (!rodata || !rodataSize) return false;
     uintptr_t zts = scanMem(rodata, rodataSize, cls, strlen(cls)+1);
-    if (!zts) { LOGE("hookVtable: ZTS not found for %s", cls); return false; }
-
+    if (!zts) return false;
     size_t drrSize = 0;
     uintptr_t drr = GlossGetLibSection(MCPE_LIB, ".data.rel.ro", &drrSize);
-    if (!drr || !drrSize) { LOGE("hookVtable: no .data.rel.ro for %s", cls); return false; }
-
+    if (!drr || !drrSize) return false;
     uintptr_t zti = 0;
     for (size_t i = 0; i+sizeof(uintptr_t) <= drrSize; i += sizeof(uintptr_t))
         if (*reinterpret_cast<uintptr_t*>(drr+i) == zts) { zti = drr+i-sizeof(uintptr_t); break; }
-    if (!zti) { LOGE("hookVtable: ZTI not found for %s", cls); return false; }
-
+    if (!zti) return false;
     uintptr_t vtbl = 0;
     for (size_t i = 0; i+sizeof(uintptr_t) <= drrSize; i += sizeof(uintptr_t))
         if (*reinterpret_cast<uintptr_t*>(drr+i) == zti) { vtbl = drr+i+sizeof(uintptr_t); break; }
-    if (!vtbl) { LOGE("hookVtable: VTable not found for %s", cls); return false; }
-
+    if (!vtbl) return false;
     void** vt = reinterpret_cast<void**>(vtbl);
     *outOrig = vt[slot];
     Unprotect(vtbl + slot*sizeof(void*), sizeof(void*));
@@ -176,41 +187,8 @@ static bool hookVtable(const char* cls, int slot, void** outOrig, void* hookFn) 
     return true;
 }
 
-static bool PatchMemory(void* addr, const void* data, size_t size) {
-    uintptr_t page_start = (uintptr_t)addr & ~(4095UL);
-    size_t    page_size  = ((uintptr_t)addr + size - page_start + 4095) & ~(4095UL);
-    if (mprotect((void*)page_start, page_size, PROT_READ|PROT_WRITE|PROT_EXEC) != 0)
-        return false;
-    memcpy(addr, data, size);
-    __builtin___clear_cache((char*)addr, (char*)addr + size);
-    mprotect((void*)page_start, page_size, PROT_READ|PROT_EXEC);
-    return true;
-}
-
-static bool PatchNametag() {
-    uintptr_t addr = pl::signature::pl_resolve_signature(NAMETAG_SIGNATURE, MCPE_LIB);
-    if (addr == 0) return false;
-    g_patchTarget = reinterpret_cast<void*>(addr + PATCH_OFFSET);
-    memcpy(g_originalBytes, g_patchTarget, PATCH_SIZE);
-    if (PatchMemory(g_patchTarget, PATCH_BYTES, PATCH_SIZE)) {
-        g_isPatched = true;
-        return true;
-    }
-    return false;
-}
-
-static bool UnpatchNametag() {
-    if (!g_patchTarget || !g_isPatched) return false;
-    if (PatchMemory(g_patchTarget, g_originalBytes, PATCH_SIZE)) {
-        g_isPatched = false;
-        return true;
-    }
-    return false;
-}
-
 static void* g_VanillaCameraAPI_orig = nullptr;
 using VanillaCameraAPI_t = int (*)(void*);
-
 static int VanillaCameraAPI_hook(void* thisPtr) {
     int value = ((VanillaCameraAPI_t)g_VanillaCameraAPI_orig)(thisPtr);
     if (value != 0 && !g_isPatched) PatchNametag();
@@ -227,15 +205,15 @@ static std::atomic<int> g_ping{-1};
 
 static int calcFPS() {
     using namespace std::chrono;
-    static auto  lastTime  = steady_clock::now();
-    static int   frames    = 0;
-    static int   cached    = 0;
+    static auto lastTime = steady_clock::now();
+    static int  frames   = 0;
+    static int  cached   = 0;
     frames++;
     auto now     = steady_clock::now();
     auto elapsed = duration_cast<milliseconds>(now - lastTime).count();
     if (elapsed >= 1000) {
-        cached  = (int)(frames * 1000.0f / elapsed);
-        frames  = 0;
+        cached   = (int)(frames * 1000.0f / elapsed);
+        frames   = 0;
         lastTime = now;
         g_fps.store(cached);
     }
@@ -243,7 +221,7 @@ static int calcFPS() {
 }
 
 // ─────────────────────────────────────────────────────────
-//  BAGIAN 3: Hook getNameTag
+//  BAGIAN 3: Hook getNameTag — sig scan saja, no vtable
 // ─────────────────────────────────────────────────────────
 
 using getNameTag_t = std::string* (*)(void*);
@@ -256,7 +234,6 @@ static std::string* hook_getNameTag(void* actor) {
 
     int fps  = calcFPS();
     int ping = g_ping.load();
-
     char suffix[32];
     if (ping >= 0)
         snprintf(suffix, sizeof(suffix), " (%dms)", ping);
@@ -267,55 +244,28 @@ static std::string* hook_getNameTag(void* actor) {
     return &g_modifiedTag;
 }
 
-// Strategi 1: vtable hook — tidak tergantung signature, lebih reliable
-// Coba slot 59-63 (rentang getNameTag di berbagai versi MCBE ARM64)
-static bool tryVtableHookGetNameTag() {
-    size_t rodataSize = 0;
-    uintptr_t rodata = GlossGetLibSection(MCPE_LIB, ".rodata", &rodataSize);
-    if (!rodata || !rodataSize) return false;
-
-    // Cari ZTS "5Actor"
-    const char* cls = "5Actor";
-    uintptr_t zts = scanMem(rodata, rodataSize, cls, strlen(cls)+1);
-    if (!zts) { LOGE("vtableHook: ZTS 5Actor not found"); return false; }
-
-    size_t drrSize = 0;
-    uintptr_t drr = GlossGetLibSection(MCPE_LIB, ".data.rel.ro", &drrSize);
-    if (!drr || !drrSize) return false;
-
-    uintptr_t zti = 0;
-    for (size_t i = 0; i+sizeof(uintptr_t) <= drrSize; i += sizeof(uintptr_t))
-        if (*reinterpret_cast<uintptr_t*>(drr+i) == zts) { zti = drr+i-sizeof(uintptr_t); break; }
-    if (!zti) { LOGE("vtableHook: ZTI not found"); return false; }
-
-    uintptr_t vtbl = 0;
-    for (size_t i = 0; i+sizeof(uintptr_t) <= drrSize; i += sizeof(uintptr_t))
-        if (*reinterpret_cast<uintptr_t*>(drr+i) == zti) { vtbl = drr+i+sizeof(uintptr_t); break; }
-    if (!vtbl) { LOGE("vtableHook: vtable not found"); return false; }
-
-    // Coba slot 59-63, pakai GlossHook untuk trampolin aman
-    void** vt = reinterpret_cast<void**>(vtbl);
-    static const int slots[] = {61, 62, 60, 59, 63, 64, 58};
-    for (int slot : slots) {
-        void* fnPtr = vt[slot];
-        if (!fnPtr) continue;
-
-        void* orig = nullptr;
-        // Gunakan GlossHook pada fungsi pointer dari vtable (lebih aman dari patch vtable langsung)
-        if (GlossHook(fnPtr, (void*)hook_getNameTag, &orig) == 0) {
-            g_orig_getNameTag = orig;
-            LOGI("getNameTag: vtable slot[%d] GlossHook OK", slot);
-            return true;
-        }
-    }
-    LOGE("getNameTag: semua vtable slot gagal di-hook");
-    return false;
+// Validasi: pastikan addr masuk range .text libminecraftpe.so
+static bool isValidTextAddr(uintptr_t addr) {
+    size_t textSize = 0;
+    uintptr_t textBase = GlossGetLibSection(MCPE_LIB, ".text", &textSize);
+    if (!textBase || !textSize) return true; // tidak bisa cek, asumsikan valid
+    return (addr >= textBase && addr < textBase + textSize);
 }
 
-// Strategi 2: signature scan multi-kandidat
-static bool trySigScanGetNameTag() {
+static bool hookGetNameTag() {
+    // Daftar signature — dari paling spesifik ke paling wildcard
+    // Semua adalah ARM64 prologue Actor::getNameTag di berbagai versi MCBE
     static const char* sigs[] = {
-        // MCBE 1.20.x - 1.21.x (paling umum)
+        // ── Versi 1.20.x / 1.21.x ──
+        "F4 4F BE A9 "
+        "FD 7B 01 A9 "
+        "FD 43 00 91 "
+        "F4 03 00 AA "
+        "? ? 40 F9 "
+        "? ? 40 F9 "
+        "? ? 40 F9 "
+        "60 02 40 F9",
+
         "F4 4F BE A9 "
         "FD 7B 01 A9 "
         "FD 43 00 91 "
@@ -323,15 +273,15 @@ static bool trySigScanGetNameTag() {
         "? ? 40 F9 "
         "? ? 40 F9",
 
-        // Variasi 1: frame size berbeda
-        "F6 57 BD A9 "
-        "F4 4F 01 A9 "
-        "FD 7B 02 A9 "
-        "FD 83 00 91 "
-        "F4 03 00 AA "
+        // ── Versi 1.19.x ──
+        "F3 0F 1E F8 "
+        "FD 7B BF A9 "
+        "FD 03 00 91 "
+        "F3 03 00 AA "
+        "? ? 40 F9 "
         "? ? 40 F9",
 
-        // Variasi 2: prologue wildcard lebih banyak
+        // ── Wildcard lebih banyak ──
         "? ? BE A9 "
         "FD 7B ? A9 "
         "FD ? 00 91 "
@@ -340,28 +290,33 @@ static bool trySigScanGetNameTag() {
         "? ? 40 F9 "
         "? ? 40 F9",
 
-        // MCBE 1.19.x
-        "F4 4F BE A9 "
-        "FD 7B 01 A9 "
-        "FD 43 00 91 "
-        "F4 03 00 AA "
-        "? ? 40 F9",
-
         nullptr
     };
 
     for (int i = 0; sigs[i]; ++i) {
         uintptr_t addr = pl::signature::pl_resolve_signature(sigs[i], MCPE_LIB);
-        if (!addr) { LOGI("sig[%d] not found", i); continue; }
+        if (!addr) {
+            LOGI("getNameTag sig[%d]: not found", i);
+            continue;
+        }
+
+        // Validasi range — jangan hook alamat di luar .text
+        if (!isValidTextAddr(addr)) {
+            LOGE("getNameTag sig[%d]: addr 0x%lx di luar .text, skip", i, (unsigned long)addr);
+            continue;
+        }
 
         void* orig = nullptr;
-        if (GlossHook((void*)addr, (void*)hook_getNameTag, &orig) == 0) {
+        int ret = GlossHook((void*)addr, (void*)hook_getNameTag, &orig);
+        if (ret == 0) {
             g_orig_getNameTag = orig;
-            LOGI("getNameTag: sig[%d] hooked OK", i);
+            LOGI("getNameTag sig[%d]: hooked OK @ 0x%lx", i, (unsigned long)addr);
             return true;
         }
-        LOGE("getNameTag: sig[%d] found but GlossHook failed", i);
+        LOGE("getNameTag sig[%d]: GlossHook ret=%d", i, ret);
     }
+
+    LOGE("getNameTag: semua sig gagal");
     return false;
 }
 
@@ -376,22 +331,11 @@ void ThirdPersonNametag_Init() {
     hookVtable("16VanillaCameraAPI", 7,
                &g_VanillaCameraAPI_orig,
                (void*)VanillaCameraAPI_hook);
-
     if (!g_isPatched) PatchNametag();
 
-    // FPS hook: vtable dulu, fallback sig scan
-    bool fpsOK = tryVtableHookGetNameTag();
-    if (!fpsOK) {
-        LOGI("vtable hook gagal, coba sig scan...");
-        fpsOK = trySigScanGetNameTag();
-    }
-
-    if (fpsOK)
-        LOGI("FPS display ON");
-    else
-        LOGE("FPS display OFF - nametag tetap jalan normal");
-
-    LOGI("FPSNametag v3 ready!");
+    // FPS hook — sig scan saja, tidak ada vtable hook Actor
+    bool fpsOK = hookGetNameTag();
+    LOGI("FPSNametag v4 ready! fps=%s", fpsOK ? "ON" : "OFF(nametag ok)");
 }
 
 __attribute__((destructor))
